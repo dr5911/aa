@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# cdr_universal_cloud_export.sh
+# Universal SIP/PBX CDR export (Asterisk CSV or MySQL), CSV/JSON, upload to AWS S3, with automatic error handling
+
+set -euo pipefail
+
+# --- USER INPUT ---
+read -p "Enter phone number (E.164 format, e.g., +923044451674): " PHONE
+
+# --- CONFIGURATION ---
+ASTERISK_CDR_DIR="/var/log/asterisk/cdr-csv"
+DB_HOST="localhost"
+DB_USER="cdruser"
+DB_PASS="P@ssw0rd"   # Replace with secure password
+DB_NAME="voip"
+AWS_BUCKET="s3://cdr-exports-yourcompany"
+OUTPUT_DIR="/tmp/cdr_export"
+DATESTAMP=$(date +%F_%H%M%S)
+CSV_FILE="${OUTPUT_DIR}/cdr_${PHONE}_${DATESTAMP}.csv"
+JSON_FILE="${OUTPUT_DIR}/cdr_${PHONE}_${DATESTAMP}.json"
+LOG_FILE="${OUTPUT_DIR}/cdr_export_${DATESTAMP}.log"
+
+mkdir -p "$OUTPUT_DIR"
+chmod 700 "$OUTPUT_DIR"
+
+# --- Logging function ---
+log() { echo "[$(date +'%F %T')] $1" | tee -a "$LOG_FILE"; }
+
+# --- 1. Try Asterisk CSV first ---
+if [ -f "${ASTERISK_CDR_DIR}/Master.csv" ]; then
+    log "Master.csv found, extracting CDRs from CSV..."
+    awk -F',' -v phone="$PHONE" 'BEGIN{OFS=","} $3==phone || $4==phone {print $0}' \
+    "${ASTERISK_CDR_DIR}/Master.csv" > "$CSV_FILE" || log "Warning: Failed to extract from CSV, trying MySQL fallback..."
+fi
+
+# --- 2. Fallback to MySQL if CSV missing or empty ---
+if [ ! -s "$CSV_FILE" ]; then
+    log "CSV missing or empty. Extracting from MySQL..."
+    mysql -u "$DB_USER" -p"$DB_PASS" -h "$DB_HOST" -e \
+    "SELECT calldate, clid, src, dst, duration, disposition, accountcode
+     FROM cdr
+     WHERE src='$PHONE' OR dst='$PHONE';" \
+    "$DB_NAME" > "$CSV_FILE" 2>>"$LOG_FILE" || { log "Error: MySQL extraction failed"; exit 1; }
+
+    # Add header if missing
+    sed -i '1i calldate,clid,src,dst,duration,disposition,accountcode' "$CSV_FILE"
+fi
+
+log "Filtered CSV ready -> $CSV_FILE"
+
+# --- 3. Convert CSV to JSON ---
+python3 - <<EOF
+import csv, json, pathlib, sys
+
+csv_file = pathlib.Path("$CSV_FILE")
+json_file = pathlib.Path("$JSON_FILE")
+
+try:
+    with csv_file.open(newline='') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    with json_file.open('w') as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+
+    print(f"Converted JSON saved -> {json_file}")
+except Exception as e:
+    print(f"Error converting CSV to JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+EOF
+
+# --- 4. Upload to AWS S3 with retry ---
+UPLOAD_RETRY=3
+for i in $(seq 1 $UPLOAD_RETRY); do
+    if aws s3 cp "$CSV_FILE" "${AWS_BUCKET}/${DATESTAMP}/" && aws s3 cp "$JSON_FILE" "${AWS_BUCKET}/${DATESTAMP}/"; then
+        log "Upload complete: CSV & JSON -> ${AWS_BUCKET}/${DATESTAMP}/"
+        break
+    else
+        log "Upload attempt $i failed, retrying in 10s..."
+        sleep 10
+    fi
+    if [ "$i" -eq "$UPLOAD_RETRY" ]; then
+        log "Error: Upload failed after $UPLOAD_RETRY attempts"
+        exit 2
+    fi
+done
+
+log "CDR export process completed successfully."
